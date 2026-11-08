@@ -17,7 +17,12 @@ corridor as wide as the ship, straight ahead) and raises an alert:
                within 20 cm                                (amber)
     IN PATH    in the ship's path but not approaching      (yellow)
     CLEAR      will pass to the side                       (green)
-with a STEER LEFT / STEER RIGHT suggestion for the most urgent one.
+It also PLANS A ROUTE through the asteroids (drawn in light blue): it keeps
+straight if it can, otherwise it goes around, or SNAKES left and right through
+gaps when there's room, then comes back onto its heading. The banner shows the
+manoeuvre (HOLD COURSE / STEER LEFT / GO AROUND RIGHT / SNAKE L>R) and the line
+beside the ship shows where each turn starts. If there's no gap wide enough
+for the ship, it says NO GAP - REVERSE THRUST.
 
 How it works underneath:
 
@@ -105,7 +110,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from acconeer.exptool import a121
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Polygon, Rectangle
 from matplotlib.widgets import Button
 
 POINT_M = 2.5e-3              # one A121 distance "point" is 2.5 mm
@@ -839,7 +844,7 @@ class ThreatAssessor:
             self.last_steer[tr.id] = steer
         return {"id": tr.id, "track": tr, "angle": angle, "x": x, "y": y, "close": close,
                 "x_impact": x_impact, "closing": closing, "tti": tti, "level": level,
-                "steer": steer, "blob": blob, "from_memory": from_memory}
+                "steer": steer, "blob": blob, "from_memory": from_memory, "vx": vx}
 
     def update(self, fused, radar_only, now):
         asteroids, live = [], set()
@@ -860,6 +865,166 @@ class ThreatAssessor:
                                       a["tti"] if a["tti"] is not None else np.inf,
                                       a["track"].distance))
         return asteroids
+
+
+# ========================================================== route planner ====
+
+ROUTE_COLOR = "#7df9ff"
+SWEEP_PERIOD_S = 3.0          # one pass across the screen (left to right or back)
+SWEEP_TRAIL_DEG = 40          # length of the fading trail behind the sweep line
+
+
+class RoutePlanner:
+    """Finds a safe route for the ship through the asteroids, weaving if needed.
+
+    The space ahead is split into rows every 2 cm (forward) and columns every
+    1 cm (sideways). A spot is safe if the ship (half its width plus a margin)
+    can sit there without touching any asteroid. Each row the ship may slide
+    up to 2 cm sideways (a 45 degree turn at most). Dynamic programming then
+    finds the cheapest safe route from the ship to the far edge of the screen,
+    where cost = how much it turns + how far it strays from its heading. So it
+    keeps straight when it can, goes around when it must, and snakes back and
+    forth through gaps when there's room - then comes back onto its heading.
+
+    Only space the sensors can see is used (inside the camera's view), and
+    asteroids with no known direction (radar only) can't be planned around.
+    """
+
+    DY, DX = 0.02, 0.01                 # row spacing (forward), column spacing (sideways)
+    MAX_STEP = 2                        # columns per row: 2 cm per 2 cm = 45 degrees
+    W_TURN, W_OFF, W_END, W_PREV = 1.0, 0.5, 0.5, 0.2
+
+    def __init__(self, half_path, R, hfov_deg):
+        self.half_path = half_path
+        self.R = R
+        self.ys = np.arange(self.DY, R + 1e-9, self.DY)
+        self.xs = np.arange(-0.8 * R, 0.8 * R + 1e-9, self.DX)
+        view = np.abs(self.xs)[None, :] <= (self.ys[:, None] * np.tan(np.radians(hfov_deg / 2))
+                                            + half_path)
+        self.view = view
+        self.prev = None                 # last route's x per row (keeps it from flip-flopping)
+
+    @staticmethod
+    def obstacles(asteroids, hfov_deg):
+        obs = []
+        for a in asteroids:
+            if a["x"] is None or a["track"].suspect:
+                continue
+            size = 0.03
+            if a["blob"] is not None:   # width from the camera box
+                size = a["track"].distance * np.radians(a["blob"]["box"][2] / CAM_W * hfov_deg)
+            radius = float(np.clip(size / 2, 0.01, 0.05))
+            radius += min(abs(a.get("vx", 0.0)) * 1.0, 0.03)   # sideways movers: extra room
+            obs.append((a["x"], a["y"], radius, a["id"]))
+        return obs
+
+    def plan(self, obstacles):
+        xs, ys, n = self.xs, self.ys, len(self.xs)
+        free = self.view.copy()
+        for ox, oy, r, _ in obstacles:
+            free &= np.hypot(xs[None, :] - ox, ys[:, None] - oy) > self.half_path + r
+        cost = np.full(n, np.inf)
+        cost[np.argmin(np.abs(xs))] = 0.0             # start: the ship, on its heading
+        back = np.zeros((len(ys), n), int)
+        idx = np.arange(n)
+        blocked_at = None
+        prev = self.prev if self.prev is not None and len(self.prev) == len(ys) else None
+        for k in range(len(ys)):
+            best = np.full(n, np.inf)
+            arg = np.zeros(n, int)
+            for step in range(-self.MAX_STEP, self.MAX_STEP + 1):
+                came = np.full(n, np.inf)
+                if step >= 0:
+                    came[step:] = cost[:n - step]
+                else:
+                    came[:step] = cost[-step:]
+                c = came + self.W_TURN * (step * self.DX) ** 2
+                better = c < best
+                best[better] = c[better]
+                arg[better] = idx[better] - step
+            best += self.W_OFF * xs ** 2 * self.DY
+            if prev is not None:
+                best += self.W_PREV * (xs - prev[k]) ** 2 * self.DY
+            best[~free[k]] = np.inf
+            if not np.isfinite(best).any():
+                blocked_at = k
+                break
+            cost, back[k] = best, arg
+        last = (blocked_at if blocked_at is not None else len(ys)) - 1
+        if last < 0:
+            self.prev = None
+            return {"path": [(0.0, 0.0)], "moves": [], "passes": [], "blocked_at": float(ys[0]),
+                    "deviates": True}
+        j = int(np.argmin(cost + self.W_END * xs ** 2))
+        cols = [j]
+        for k in range(last, 0, -1):
+            j = back[k][j]
+            cols.append(j)
+        cols.reverse()
+        path_x = xs[cols]
+        path = [(0.0, 0.0)] + list(zip(path_x.tolist(), ys[:last + 1].tolist()))
+        self.prev = None if blocked_at is not None else path_x
+        # Which side the ship passes each nearby asteroid on, nearest first
+        passes = []
+        for ox, oy, r, oid in sorted(obstacles, key=lambda o: o[1]):
+            if oy > ys[last]:
+                continue
+            px = float(np.interp(oy, ys[:last + 1], path_x))
+            if abs(px - ox) <= self.half_path + r + 0.06:
+                passes.append((oid, "LEFT" if px < ox else "RIGHT"))
+        return {"path": path, "moves": self._moves(path), "passes": passes,
+                "blocked_at": None if blocked_at is None else float(ys[blocked_at]),
+                "deviates": bool(np.max(np.abs(path_x)) > self.DX / 2)}
+
+    def _moves(self, path):
+        """Route -> list of (move, y where it starts): HOLD / LEFT / RIGHT."""
+        moves = []
+        for (x0, y0), (x1, _) in zip(path[:-1], path[1:]):
+            move = "HOLD" if abs(x1 - x0) < self.DX / 2 else ("LEFT" if x1 < x0 else "RIGHT")
+            if moves and moves[-1][0] == move:
+                continue
+            moves.append((move, y0))
+        # drop very short holds between turns the same way, and merge
+        clean = []
+        for i, (move, y) in enumerate(moves):
+            end = moves[i + 1][1] if i + 1 < len(moves) else path[-1][1]
+            if (move == "HOLD" and 0 < i < len(moves) - 1 and end - y < 0.05
+                    and moves[i - 1][0] == moves[i + 1][0]):
+                continue
+            if clean and clean[-1][0] == move:
+                continue
+            clean.append((move, y))
+        return clean
+
+
+def route_text(route, long=False):
+    """Short text for the banner, or the full route for the route line."""
+    if route is None:
+        return ""
+    route.setdefault("passes", [])
+    turns = [m for m, _ in route["moves"] if m != "HOLD"]
+    if route["blocked_at"] is not None and not turns:
+        return "NO GAP - REVERSE THRUST"
+    if long:
+        parts = [f"{m} @{y * 100:.0f}cm" for m, y in route["moves"] if m != "HOLD"][:4]
+        if (route["blocked_at"] is None and route["moves"] and route["moves"][-1][0] == "HOLD"
+                and abs(route["path"][-1][0]) < 0.015):
+            parts.append("on course")
+        text = " > ".join(parts) if parts else "HOLD"
+        if route["blocked_at"] is not None:
+            text += f" > BLOCKED @{route['blocked_at'] * 100:.0f}cm"
+        return text
+    if route["blocked_at"] is not None:
+        return "NO GAP - REVERSE THRUST"
+    if not turns:
+        return "HOLD COURSE"
+    sides = [side for _, side in route.get("passes", [])]
+    weave = [s for i, s in enumerate(sides) if i == 0 or s != sides[i - 1]]
+    if len(weave) >= 2:                  # passes asteroids on alternating sides
+        return "SNAKE " + ">".join(t[0] for t in turns[:5])          # e.g. SNAKE L>R
+    if len(turns) == 1:
+        return f"STEER {turns[0]}"
+    return f"GO AROUND {turns[0]}"                                   # out and back
 
 
 def track_color(track_id):
@@ -994,6 +1159,21 @@ class Display:
                               bbox=dict(facecolor=GREEN, edgecolor="none", pad=5))
         self.readout = ax.text(-R, R * 1.53, "", color=GREEN, fontsize=10, linespacing=1.15,
                                family="monospace", va="top", fontweight="bold", zorder=12)
+        # Radar sweep: a bright line swinging back and forth across the screen
+        # with a fading trail. (Visual only - the XE125 sees its whole beam at
+        # once - but asteroids "ping" as the sweep passes over them.)
+        self.sweep_on = True
+        self.sweep_trail = []
+        for i in range(8):
+            poly = Polygon(np.zeros((3, 2)), closed=True, color=GREEN, lw=0,
+                           alpha=0.22 * (1 - i / 8) ** 1.5, zorder=2)
+            ax.add_patch(poly)
+            self.sweep_trail.append(poly)
+        self.sweep_line, = ax.plot([0, 0], [0, R], color=GREEN, lw=2.2, alpha=0.9, zorder=5)
+        self.sweep_prev = None
+        self.pings = {}                  # asteroid id -> time the sweep last crossed it
+        self.route_line = ax.text(0.09 * R, -0.08 * R, "", color=ROUTE_COLOR, fontsize=8,
+                                  family="monospace", fontweight="bold", va="center", zorder=12)
 
     def _setup_camera(self):
         ax = self.ax_cam
@@ -1090,7 +1270,7 @@ class Display:
         self.zone_flash_until = time.time() + 1.5
 
     def update(self, frame, amp, threshold, asteroids, camera_only,
-               radar_det, cam_det, collecting_bg, focus, auto_text=""):
+               radar_det, cam_det, collecting_bg, focus, auto_text="", route=None):
         # ---- camera view
         if frame is not None:
             self.cam_img.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -1194,6 +1374,79 @@ class Display:
                                         ha="center", zorder=10))
             lines.append(f"?    ---       {abs(blob['angle']):4.1f}°   seen by camera, no radar lock")
 
+        # Radar sweep and pings
+        if self.sweep_on:
+            now_s = time.monotonic()
+            phase = (now_s / SWEEP_PERIOD_S) % 2.0           # 0..1 left->right, 1..2 back
+            going_right = phase < 1.0
+            frac = phase if going_right else 2.0 - phase
+            sweep = np.radians(180.0 * (1 - frac))           # 180 deg = left edge, 0 = right
+            self.sweep_line.set_data([0, R * np.cos(sweep)], [0, R * np.sin(sweep)])
+            behind = 1.0 if going_right else -1.0            # trail lies behind the motion
+            seg = np.radians(SWEEP_TRAIL_DEG) / len(self.sweep_trail)
+            for i, poly in enumerate(self.sweep_trail):
+                a0 = np.clip(sweep + behind * i * seg, 0, np.pi)
+                a1 = np.clip(sweep + behind * (i + 1) * seg, 0, np.pi)
+                t = np.linspace(a0, a1, 6)
+                poly.set_xy(np.c_[np.r_[0, R * np.cos(t)], np.r_[0, R * np.sin(t)]])
+            # an asteroid pings when the sweep line crosses its bearing
+            if self.sweep_prev is not None:
+                lo, hi = sorted((self.sweep_prev, sweep))
+                for ast in asteroids:
+                    if ast["x"] is not None:
+                        bearing = np.arctan2(ast["y"], ast["x"])
+                        if lo - 0.02 <= bearing <= hi + 0.02:
+                            self.pings[ast["id"]] = now_s
+            self.sweep_prev = sweep
+            live = {a["id"] for a in asteroids}
+            for aid in list(self.pings):
+                if aid not in live:
+                    del self.pings[aid]
+            for ast in asteroids:
+                age = now_s - self.pings.get(ast["id"], -99)
+                if ast["x"] is not None and age < 0.8:
+                    k = age / 0.8                                # 0 -> 1 as the ping fades
+                    self.dynamic.append(ax.scatter(
+                        [ast["x"]], [ast["y"]], s=430 + 2600 * k, facecolors="none",
+                        edgecolors=THREAT_COLORS[ast["level"]], linewidths=2,
+                        alpha=0.9 * (1 - k), zorder=8))
+
+        # Planned route through the asteroids
+        self.route_line.set_text("")
+        if route is not None and radar_det.background is not None and (
+                route["deviates"] or route["blocked_at"] is not None):
+            px = np.array([p[0] for p in route["path"]])
+            py = np.array([p[1] for p in route["path"]])
+            if len(px) >= 5:                                   # gentle smoothing for drawing
+                k = np.ones(3) / 3
+                px = np.r_[px[0], np.convolve(px, k, "valid"), px[-1]]
+            blocked = route["blocked_at"] is not None
+            col = RED if blocked else ROUTE_COLOR
+            # the ship's width along the route, then the route itself
+            self.dynamic.append(ax.fill_betweenx(py, px - self.half_path, px + self.half_path,
+                                                 color=col, alpha=0.10, zorder=3))
+            self.dynamic.append(ax.plot(px, py, color=col, lw=3, alpha=0.95, zorder=6,
+                                        solid_capstyle="round")[0])
+            if len(px) >= 2:
+                self.dynamic.append(ax.annotate(
+                    "", xy=(px[-1], py[-1]), xytext=(px[-2], py[-2]), zorder=6,
+                    arrowprops=dict(arrowstyle="-|>,head_width=0.5,head_length=0.8",
+                                    color=col, lw=3)))
+            if blocked:
+                self.dynamic.append(ax.plot([px[-1]], [route["blocked_at"]], "x", color=RED,
+                                            ms=16, mew=4, zorder=7)[0])
+            for i, (move, y) in enumerate(route["moves"]):
+                if move == "HOLD" or y <= 0.0 and i > 0:
+                    continue
+                kk = int(np.argmin(np.abs(py - y)))
+                side = 1 if move == "LEFT" else -1      # label on the outside of the bend
+                self.dynamic.append(ax.text(px[kk] + side * 0.03 * R, py[kk], move,
+                                            color=col, fontsize=8, family="monospace",
+                                            fontweight="bold", va="center",
+                                            ha="right" if side < 0 else "left", zorder=11))
+            self.route_line.set_text("ROUTE: " + route_text(route, long=True))
+            self.route_line.set_color(col)
+
         # Alert banner + steering advice for the most urgent asteroid
         urgent = asteroids[0] if asteroids else None
         if radar_det.background is None:
@@ -1213,7 +1466,10 @@ class Display:
                                         color=RED, alpha=0.55 if blink else 0.15,
                                         zorder=3)[0])
         elif urgent and urgent["level"] in ("COLLISION", "WARNING"):
-            steer = f"STEER {urgent['steer']}" if urgent["steer"] else "EVADE NOW"
+            if route is not None and (route["deviates"] or route["blocked_at"] is not None):
+                steer = route_text(route)
+            else:
+                steer = f"STEER {urgent['steer']}" if urgent["steer"] else "EVADE NOW"
             tti, dist_cm = urgent["tti"], urgent["track"].distance * 100
             if urgent["track"].suspect:
                 text = (f"CHECK: A{urgent['id']} ECHO AT {dist_cm:.0f} cm  -  "
@@ -1232,7 +1488,7 @@ class Display:
             self.banner.set_color("black")
             self.banner.get_bbox_patch().set_facecolor(color)
             self.banner.get_bbox_patch().set_alpha(1)
-            if urgent["steer"]:
+            if urgent["steer"] and (route is None or urgent["x"] is None):
                 sign = -1 if urgent["steer"] == "LEFT" else 1
                 self.dynamic.append(ax.annotate(
                     "", xy=(sign * 0.32 * R, 0.16 * R), xytext=(0, 0.03 * R), zorder=11,
@@ -1246,6 +1502,8 @@ class Display:
             in_path = [a for a in asteroids if a["level"] == "IN PATH"]
             text = (f"CAUTION: A{in_path[0]['id']} IN SHIP'S PATH" if in_path
                     else "ALL CLEAR")
+            if in_path and route is not None and (route["deviates"] or route["blocked_at"] is not None):
+                text += f"  -  {route_text(route)}"
             self.banner.set_text(text)
             self.banner.set_color("black")
             self.banner.get_bbox_patch().set_facecolor(YELLOW if in_path else GREEN)
@@ -1303,6 +1561,8 @@ def parse_args():
                    help="Collision alert below this many seconds (default 3)")
     p.add_argument("--danger-distance", type=float, default=10.0,
                    help="Anything closer than this (cm) is an imminent collision (default 10)")
+    p.add_argument("--no-sweep", action="store_true",
+                   help="Turn off the sweeping line on the radar screen")
     p.add_argument("--boost", type=int, default=1, choices=[1, 2, 3, 4],
                    help="Average more on the radar chip for weaker objects: 2, 3 or 4 "
                         "times the normal averaging (default 1). Press b again after "
@@ -1352,9 +1612,15 @@ def main():
     display = Display(dist, args.hfov, args.ship_width / 100, args.heading,
                       args.warn, args.danger, args.danger_distance / 100,
                       args.warn_distance / 100, args.brace_distance / 100)
+    if args.no_sweep:
+        display.sweep_on = False
+        display.sweep_line.set_visible(False)
+        for poly in display.sweep_trail:
+            poly.set_visible(False)
     assessor = ThreatAssessor(args.ship_width / 100, args.warn, args.danger,
                               args.danger_distance / 100, args.warn_distance / 100,
                               args.brace_distance / 100)
+    planner = RoutePlanner(args.ship_width / 200 + PATH_MARGIN, float(dist[-1]), args.hfov)
     memory = {}
     state = {"running": True, "bg": None, "mirror": args.mirror,
              "draw": None,       # outline being drawn: points, held, freehand, press point
@@ -1643,6 +1909,7 @@ def main():
                         state["phase"] = None
                         tracker.reset()
                         assessor.reset()
+                        planner.prev = None
                         memory.clear()
                         radar_buf.clear()
                         cam_buf.clear()
@@ -1685,8 +1952,11 @@ def main():
             else:
                 fused, radar_only, camera_only = [], [], []
             asteroids = assessor.update(fused, radar_only, now)
+            route = None
+            if radar_det.background is not None and collecting != "record":
+                route = planner.plan(RoutePlanner.obstacles(asteroids, args.hfov))
             display.update(frame, amp, threshold, asteroids, camera_only,
-                           radar_det, cam_det, collecting, state["focus"], auto_text)
+                           radar_det, cam_det, collecting, state["focus"], auto_text, route)
             canvas.draw_idle()
             plt.pause(1 / DISPLAY_FPS)
     finally:
